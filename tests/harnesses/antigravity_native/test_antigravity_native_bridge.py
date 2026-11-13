@@ -7,6 +7,7 @@ import logging
 import os
 import shlex
 import subprocess
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.process_logging import data_dir
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -449,6 +451,113 @@ def test_update_conversation_id_returns_false_and_warns_when_no_state(
         record.levelno == logging.WARNING and "agy_conv_new" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_update_conversation_id_expect_placeholder_replaces_a_placeholder(
+    bridge_dir: Path,
+) -> None:
+    """With ``expect_placeholder`` an ``agy_conv_*`` placeholder is still replaced."""
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_test", conversation_id="agy_conv_seed"),
+    )
+    assert update_conversation_id(bridge_dir, "conv_agy_real", expect_placeholder=True) is True
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "conv_agy_real"
+
+
+def test_update_conversation_id_expect_placeholder_keeps_a_real_id(bridge_dir: Path) -> None:
+    """
+    With ``expect_placeholder`` a real id already in state is never replaced.
+
+    Guards the race between a cold-start and the reader's placeholder recovery:
+    the writer that loses must not clobber the other's live binding.
+    """
+    _seed_active_turn(bridge_dir, "turn_live")
+    assert update_conversation_id(bridge_dir, "conv_agy_other", expect_placeholder=True) is False
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == "conv_agy_test"
+    assert state.active_turn_id == "turn_live"
+
+
+@pytest.mark.parametrize(
+    ("second_writer", "expected_results", "expected_conversation_id"),
+    [
+        pytest.param(
+            "update", {"first": True, "second": False}, "conv_agy_first", id="racing-update"
+        ),
+        pytest.param("recreate", {"first": True}, "agy_conv_relaunch", id="terminal-recreation"),
+    ],
+)
+def test_update_conversation_id_expect_placeholder_serializes_racing_writers(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_writer: str,
+    expected_results: dict[str, bool],
+    expected_conversation_id: str,
+) -> None:
+    """
+    A guarded update paused before its write holds off other bridge-state writers.
+    A second update waits and keeps the first's id; a terminal recreation waits,
+    then clears and reseeds, so its new placeholder survives.
+
+    Guards cold-start vs reader recovery, and a recovery worker that outlives its
+    cancelled reader: all are threads of one process.
+    """
+    write_bridge_state(
+        bridge_dir,
+        AntigravityNativeBridgeState(session_id="conv_test", conversation_id="agy_conv_seed"),
+    )
+    first_is_writing = threading.Event()
+    release_first = threading.Event()
+    original_write = _mod.write_bridge_state
+
+    def paused_write(path: Path, state: AntigravityNativeBridgeState) -> None:
+        if state.conversation_id == "conv_agy_first":
+            first_is_writing.set()
+            assert release_first.wait(5), "the first writer was never released"
+        original_write(path, state)
+
+    monkeypatch.setattr(_mod, "write_bridge_state", paused_write)
+    results: dict[str, bool] = {}
+
+    def write(name: str) -> None:
+        results[name] = update_conversation_id(
+            bridge_dir, f"conv_agy_{name}", expect_placeholder=True
+        )
+
+    def recreate_terminal() -> None:
+        clear_bridge_state(bridge_dir)
+        write_bridge_state(
+            bridge_dir,
+            AntigravityNativeBridgeState(
+                session_id="conv_test", conversation_id="agy_conv_relaunch"
+            ),
+        )
+
+    first = threading.Thread(target=write, args=("first",))
+    if second_writer == "update":
+        second = threading.Thread(target=write, args=("second",))
+    else:
+        second = threading.Thread(target=recreate_terminal)
+    try:
+        first.start()
+        assert first_is_writing.wait(5)
+        second.start()
+        second.join(0.3)
+        assert second.is_alive(), "the second writer must wait for the first to finish"
+    finally:
+        release_first.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+    assert results == expected_results
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.conversation_id == expected_conversation_id
 
 
 # ---------------------------------------------------------------------------
@@ -1446,12 +1555,16 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert "sys_os_shell" in server["enabledTools"]
     assert "sys_terminal_launch" in server["enabledTools"]
     assert "sys_list_models" in server["enabledTools"]
+    assert "sys_project_list" in server["enabledTools"]
+    assert "sys_session_update" in server["enabledTools"]
+    assert "sys_project_update" in server["enabledTools"]
     assert server["enabledTools"] == sorted(server["enabledTools"])
     assert server["env"]["TMPDIR"]
-    # The relay's HOME is pinned to the runner's real home so its bridge-root
+    # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
     # path customizes process environment.
     assert server["env"]["HOME"] == str(Path.home())
+    assert server["env"]["OMNIGENT_DATA_DIR"] == str(data_dir())
 
 
 def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path) -> None:
@@ -1462,19 +1575,135 @@ def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path)
     assert server["command"] == sys.executable
 
 
-def test_write_mcp_config_targets_isolated_agy_gemini_dir(tmp_path: Path) -> None:
-    """write_mcp_config writes into the isolated agy Gemini dir, not ~/.gemini."""
+def test_write_mcp_config_targets_isolated_agy_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without a user config, the relay alone lands in the isolated agy Gemini dir, silently."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload == build_mcp_config(bridge_dir, python_executable="python-test")
+    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
+    # The bridge token the shared relay requires is written into the bridge dir.
+    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    assert not [record for record in caplog.records if record.name == _mod.__name__]
+
+
+def _write_user_mcp_config(fake_home: Path, payload: str) -> Path:
+    real_config = fake_home / ".gemini" / "config" / "mcp_config.json"
+    real_config.parent.mkdir(parents=True, exist_ok=True)
+    real_config.write_text(payload, encoding="utf-8")
+    return real_config
+
+
+def test_write_mcp_config_inherits_user_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User ~/.gemini MCP servers are seeded beside the relay; the real file is untouched."""
+    fake_home = tmp_path / "real-home"
+    graft = {"command": "/usr/local/bin/graft", "args": ["mcp"], "env": {"GRAFT_INDEX": ".graft"}}
+    user_payload = json.dumps(
+        {"mcpServers": {"graft": graft, "graphify": {"command": "/usr/local/bin/graphify"}}}
+    )
+    real_config = _write_user_mcp_config(fake_home, user_payload)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     path = write_mcp_config(bridge_dir, python_executable="python-test")
 
-    # The config lands under the isolated --gemini_dir config path, so the user's
-    # real ~/.gemini is untouched.
-    assert path == agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["mcpServers"]["omnigent"]["command"] == "python-test"
-    # The bridge token the shared relay requires is written into the bridge dir.
-    assert json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))["token"]
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    assert set(servers) == {"graft", "graphify", "omnigent"}
+    assert servers["graft"] == graft
+    assert servers["omnigent"]["command"] == "python-test"
+    assert real_config.read_text(encoding="utf-8") == user_payload
+
+
+def test_write_mcp_config_relay_wins_user_name_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user server named ``omnigent`` never displaces the session relay."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home, json.dumps({"mcpServers": {"omnigent": {"command": "/usr/local/bin/other"}}})
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    relay = build_mcp_config(bridge_dir, python_executable="python-test")["mcpServers"]
+    assert servers == relay
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["{not json", '{"mcpServers": "graft"}', None],
+    ids=["not-json", "servers-string", "directory"],
+)
+def test_write_mcp_config_tolerates_malformed_user_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    payload: str | None,
+) -> None:
+    """A malformed or unreadable user config degrades to the relay alone, with a warning."""
+    fake_home = tmp_path / "real-home"
+    if payload is None:
+        (fake_home / ".gemini" / "config" / "mcp_config.json").mkdir(parents=True)
+    else:
+        _write_user_mcp_config(fake_home, payload)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written == build_mcp_config(bridge_dir, python_executable="python-test")
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _mod.__name__ and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1 and "seeding only the Omnigent relay" in warnings[0]
+
+
+@pytest.mark.posix_only
+def test_write_mcp_config_restricts_isolated_config_to_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inherited server env blocks can hold tokens, so only the owner may read the file."""
+    fake_home = tmp_path / "real-home"
+    _write_user_mcp_config(
+        fake_home,
+        json.dumps({"mcpServers": {"graft": {"command": "graft", "env": {"GRAFT_TOKEN": "s"}}}}),
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A looser file left by an earlier write must not keep its mode.
+    stale = agy_gemini_dir(bridge_dir) / "config" / "mcp_config.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+    stale.chmod(0o644)
+    path = write_mcp_config(bridge_dir, python_executable="python-test")
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["graft"]["env"] == {
+        "GRAFT_TOKEN": "s"
+    }
 
 
 def test_write_mcp_bridge_config_is_idempotent(tmp_path: Path) -> None:
